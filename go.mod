@@ -1,6 +1,6 @@
 module github.com/grafana/gomemcache
 
-go 1.18
+go 1.20
 
 require github.com/prometheus/client_golang v1.15.0
 

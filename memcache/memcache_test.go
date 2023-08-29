@@ -1,3 +1,5 @@
+//go:build goexperiment.arenas
+
 /*
 Copyright 2011 Google Inc.
 
@@ -18,14 +20,19 @@ limitations under the License.
 package memcache
 
 import (
+	"arena"
 	"bufio"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"io/ioutil"
+	mrand "math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"path"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -34,7 +41,7 @@ import (
 
 const testServer = "localhost:11211"
 
-func setup(t *testing.T) bool {
+func setup(t testing.TB) bool {
 	c, err := net.Dial("tcp", testServer)
 	if err != nil {
 		t.Skipf("skipping test; no server running at %s", testServer)
@@ -583,6 +590,8 @@ func BenchmarkScanGetResponseLine(b *testing.B) {
 }
 
 func BenchmarkParseGetResponse(b *testing.B) {
+	b.ReportAllocs()
+
 	valueSize := 500
 	response := strings.NewReader(fmt.Sprintf("VALUE foobar1234 0 %v 1234\r\n%s\r\nEND\r\n", valueSize, strings.Repeat("a", valueSize)))
 
@@ -604,6 +613,97 @@ func BenchmarkParseGetResponse(b *testing.B) {
 		reader.Reset(response)
 
 	}
+}
+
+func BenchmarkSlabAllocator(b *testing.B) {
+	b.StopTimer()
+
+	if !setup(b) {
+		return
+	}
+
+	// create 10MB of random bytes to use as chunk contents
+	const size = 10 << 20
+	const objSize = 100000
+
+	rndBytes := make([]byte, size)
+	s, err := rand.Read(rndBytes)
+
+	if s != size || err != nil {
+		b.Fatal("nope...")
+	}
+
+	client := New(testServer)
+
+	b.Run("test things", func(b *testing.B) {
+		b.ReportAllocs()
+		b.StopTimer()
+
+		for i := 0; i < b.N; i++ {
+			// create a random offset with at least 10000 bytes before end of buffer
+			csize := mrand.Intn(objSize)
+			offset := mrand.Intn(size - objSize)
+
+			sprintf := fmt.Sprintf("foo%d", i)
+			bytes := rndBytes[offset : offset+csize]
+			err = client.Set(&Item{
+				Key:   sprintf,
+				Value: bytes,
+			})
+			if err != nil {
+				b.Fatalf("failed to set! %s", err)
+			}
+		}
+
+		// create 100 key batches
+		var keyBatches [][]string
+		const batchSize = 100
+
+		for i := 0; i < b.N; i += batchSize {
+			var batch []string
+			limit := batchSize
+			if i+batchSize > b.N {
+				limit = b.N - i
+			}
+
+			for j := 0; j < limit; j++ {
+				batch = append(batch, fmt.Sprintf("foo%d", i+j))
+			}
+
+			keyBatches = append(keyBatches, batch)
+		}
+
+		var st runtime.MemStats
+		runtime.ReadMemStats(&st)
+
+		start := st.NumGC
+
+		//alloc := newArenaAllocator()
+		alloc := newSlabAllocator([]int{1 << 10, 2 << 10, 4 << 10, 8 << 10, 16 << 10, 32 << 10, 64 << 10, 128 << 10})
+
+		b.StartTimer()
+		for _, batch := range keyBatches {
+			opt := WithAllocator(alloc)
+
+			found, err := client.GetMulti(batch, opt)
+			if err != nil {
+				b.Fatalf("failed to fetch! %s", err)
+			}
+
+			if len(found) < len(batch) {
+				b.Fatalf("requested %d items, got %d", len(batch), len(found))
+			}
+
+			for _, f := range found {
+				alloc.Put(&f.Value)
+			}
+
+			//alloc.Release()
+		}
+
+		runtime.ReadMemStats(&st)
+		b.ReportMetric(float64(st.NumGC-start), "gc-count")
+	})
 }
 
 type testAllocator struct {
@@ -638,4 +738,81 @@ func (p *testAllocator) Get(sz int) *[]byte {
 func (p *testAllocator) Put(b *[]byte) {
 	p.numPuts += 1
 	p.pool.Put(b)
+}
+
+type arenaAllocator struct {
+	ar *arena.Arena
+}
+
+func (a *arenaAllocator) Get(sz int) *[]byte {
+	b := arena.MakeSlice[byte](a.ar, sz, sz)
+	return &b
+}
+
+func (a *arenaAllocator) Put(b *[]byte) {
+	// ...
+}
+
+func (a *arenaAllocator) Release() {
+	if a.ar == nil {
+		return
+	}
+
+	a.ar.Free()
+}
+
+func newArenaAllocator() *arenaAllocator {
+	return &arenaAllocator{
+		ar: arena.NewArena(),
+	}
+}
+
+type slabAllocator struct {
+	slabs   map[int]*sync.Pool
+	classes []int
+}
+
+func (s *slabAllocator) Get(sz int) *[]byte {
+	cls := s.pickClass(sz)
+
+	var sl *[]byte
+	sl = s.slabs[cls].Get().(*[]byte)
+	*sl = (*sl)[:sz]
+	return sl
+}
+
+func (s *slabAllocator) Put(b *[]byte) {
+	cls := s.pickClass(len(*b))
+	*b = (*b)[:cls]
+	s.slabs[cls].Put(b)
+}
+
+func (s *slabAllocator) pickClass(sz int) int {
+	// classes are sorted
+	for _, class := range s.classes {
+		if sz <= class {
+			return class
+		}
+	}
+
+	panic("requested item size is larger than the largest slab class")
+}
+
+func newSlabAllocator(classes []int) *slabAllocator {
+	slices.Sort(classes)
+
+	slabs := make(map[int]*sync.Pool, len(classes))
+	for _, class := range classes {
+		slabs[class] = &sync.Pool{
+			New: func() any {
+				bytes := make([]byte, class)
+				return &bytes
+			},
+		}
+	}
+
+	return &slabAllocator{
+		slabs:   slabs,
+		classes: classes,
+	}
 }
